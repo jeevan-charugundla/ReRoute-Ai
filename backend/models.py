@@ -94,10 +94,28 @@ class FlightSegment(Base):
     estimated_departure = Column(String)
     estimated_arrival = Column(String)
 
+    actual_departure = Column(String, nullable=True)
+    actual_arrival = Column(String, nullable=True)
+
     status = Column(
         String,
         default="CONFIRMED"
     )
+
+    # Provider / enrichment fields (added in v2.1)
+    provider = Column(String, nullable=True)
+    data_source = Column(String, default="DEMO")
+    last_status_check = Column(String, nullable=True)
+    last_provider_update = Column(String, nullable=True)
+
+    delay_minutes = Column(Integer, default=0)
+
+    terminal = Column(String, nullable=True)
+    gate = Column(String, nullable=True)
+
+    airline_name = Column(String, nullable=True)
+    origin_city = Column(String, nullable=True)
+    destination_city = Column(String, nullable=True)
 
 
 # ============================================================

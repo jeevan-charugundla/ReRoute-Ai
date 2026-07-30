@@ -1,0 +1,42 @@
+# ============================================================
+# ReRoute AI — Backend Gitignore
+# ============================================================
+
+# Environment — NEVER commit credentials
+.env
+.env.local
+.env.*.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+.env_venv/
+
+# Database (development only — exclude from repo)
+*.db
+*.sqlite
+*.sqlite3
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

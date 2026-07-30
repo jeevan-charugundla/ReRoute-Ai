@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# Testing & Build outputs
+.next/
+out/
+build/
+dist/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+venv/
+.venv/
+env/
+
+# Database / Local runtime
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+server.pid
+
+# Environment & Secrets (NEVER COMMIT SECRETS)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo

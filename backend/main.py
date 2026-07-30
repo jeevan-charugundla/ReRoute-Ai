@@ -1,14 +1,64 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from datetime import datetime, timedelta
+from typing import Optional
 import uuid
 import json
+import os
+import logging
+import re
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """
+    Minimal stdlib-only .env loader.
+    Reads KEY=VALUE pairs from the .env file and sets them as environment
+    variables if they are not already set by the shell.
+    Does not require python-dotenv.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line)
+                if match:
+                    key, val = match.group(1), match.group(2).strip()
+                    # Strip surrounding quotes
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        val = val[1:-1]
+                    # Only set if not already set by the environment
+                    if key not in os.environ:
+                        os.environ[key] = val
+    except Exception:
+        pass
+
+
+# Load environment variables from backend/.env before anything else
+_load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from database import engine, SessionLocal
 import models
+from services.flight_service import get_flight_service
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Minimum connection buffer in minutes — used throughout the recovery engine
+DEFAULT_MIN_CONNECTION_MINUTES: int = int(
+    os.getenv("DEFAULT_MIN_CONNECTION_MINUTES", "75")
+)
 
 
 # ============================================================
@@ -19,13 +69,57 @@ models.Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
+# SAFE SCHEMA MIGRATION
+#
+# Adds new columns to existing tables without dropping data.
+# Each ALTER TABLE is idempotent — safe to run on every startup.
+# ============================================================
+
+def _run_safe_migrations():
+    """
+    Add new columns introduced in v2.1 to existing SQLite databases.
+    SQLite does not support multiple ADD COLUMN in one statement.
+    Each migration is wrapped in a try/except so it silently skips
+    columns that already exist.
+    """
+    new_columns = [
+        ("flight_segments", "actual_departure", "TEXT"),
+        ("flight_segments", "actual_arrival", "TEXT"),
+        ("flight_segments", "provider", "TEXT"),
+        ("flight_segments", "data_source", "TEXT DEFAULT 'DEMO'"),
+        ("flight_segments", "last_status_check", "TEXT"),
+        ("flight_segments", "last_provider_update", "TEXT"),
+        ("flight_segments", "delay_minutes", "INTEGER DEFAULT 0"),
+        ("flight_segments", "terminal", "TEXT"),
+        ("flight_segments", "gate", "TEXT"),
+        ("flight_segments", "airline_name", "TEXT"),
+        ("flight_segments", "origin_city", "TEXT"),
+        ("flight_segments", "destination_city", "TEXT"),
+    ]
+    with engine.connect() as conn:
+        for table, column, col_type in new_columns:
+            try:
+                conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                )
+                conn.commit()
+                logger.info("Migration: added column %s.%s", table, column)
+            except Exception:
+                # Column already exists — safe to ignore
+                pass
+
+
+_run_safe_migrations()
+
+
+# ============================================================
 # APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="ReRoute AI",
     description="Autonomous Travel Disruption Recovery Backend",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 
@@ -75,6 +169,47 @@ class ApprovalRequest(BaseModel):
 
 
 # ============================================================
+# ADDITIONAL REQUEST / RESPONSE MODELS
+# ============================================================
+
+class FlightStatusResponse(BaseModel):
+    """Safe response wrapping a normalized flight status."""
+    flight_number: str
+    airline_code: str
+    airline_name: Optional[str] = None
+    origin_iata: str
+    origin_name: Optional[str] = None
+    origin_city: Optional[str] = None
+    origin_terminal: Optional[str] = None
+    origin_gate: Optional[str] = None
+    destination_iata: str
+    destination_name: Optional[str] = None
+    destination_city: Optional[str] = None
+    destination_terminal: Optional[str] = None
+    destination_gate: Optional[str] = None
+    scheduled_departure: Optional[str] = None
+    estimated_departure: Optional[str] = None
+    actual_departure: Optional[str] = None
+    scheduled_arrival: Optional[str] = None
+    estimated_arrival: Optional[str] = None
+    actual_arrival: Optional[str] = None
+    delay_minutes: int = 0
+    status: str = "UNKNOWN"
+    data_source: str = "DEMO"
+    last_updated: Optional[str] = None
+    provider_warning: Optional[str] = None
+
+
+class ProviderConfigResponse(BaseModel):
+    """Non-sensitive provider configuration info."""
+    provider_name: str
+    real_data_enabled: bool
+    demo_fallback_enabled: bool
+    cache_ttl_seconds: int
+    min_connection_minutes: int
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -90,6 +225,37 @@ def make_id(prefix):
 def now_iso():
 
     return datetime.now().isoformat()
+
+
+def date_from_iso(iso_string: str) -> str:
+    """Extract YYYY-MM-DD date from an ISO datetime string."""
+    if not iso_string:
+        return datetime.now().strftime("%Y-%m-%d")
+    return iso_string[:10]
+
+
+def parse_iso_flexible(iso_string: str) -> datetime:
+    """
+    Parse an ISO datetime string that may or may not have timezone info.
+
+    Strips timezone offset and returns a naive datetime for comparison.
+    Used for connection buffer calculations where we compare same-timezone
+    airport times (both in UTC from provider).
+    """
+    if not iso_string:
+        raise ValueError("Empty datetime string")
+    # Remove timezone offset (+HH:MM or Z) for naive comparison
+    # This is safe because AviationStack returns UTC times
+    clean = iso_string
+    if clean.endswith("Z"):
+        clean = clean[:-1]
+    elif "+" in clean[10:]:
+        clean = clean[:clean.rindex("+", 10)]
+    elif clean.count("-") > 2:
+        # Negative timezone offset like 2026-07-25T10:00:00-05:30
+        last_dash = clean.rfind("-", 10)
+        clean = clean[:last_dash]
+    return datetime.fromisoformat(clean)
 
 
 def get_airline_code(flight_number):
@@ -148,7 +314,7 @@ def home():
 
         "status": "ONLINE",
 
-        "version": "2.0.0",
+        "version": "2.1.0",
 
         "message":
             "Autonomous Travel Recovery Backend Running"
@@ -814,7 +980,7 @@ def find_recovery_options(
     original_flight
 ):
 
-    minimum_buffer = 75
+    minimum_buffer = DEFAULT_MIN_CONNECTION_MINUTES
 
 
     earliest_departure = (
@@ -1543,7 +1709,7 @@ def disruption(
     # CONNECTION STILL SAFE
     # --------------------------------------------------------
 
-    if connection_buffer >= 75:
+    if connection_buffer >= DEFAULT_MIN_CONNECTION_MINUTES:
 
         trip.status = "DELAYED_BUT_SAFE"
 
@@ -2175,6 +2341,9 @@ def disruption(
             "booking_reference":
                 booking_reference,
 
+            "booking_mode":
+                "SIMULATED",
+
             "hotel":
                 hotel_result,
 
@@ -2201,6 +2370,367 @@ def disruption(
         "trip_status":
             "RECOVERED"
 
+    }
+
+
+# ============================================================
+# PROVIDER HEALTH (safe — no secrets)
+# ============================================================
+
+@app.get("/api/provider/health")
+def get_provider_health():
+    """
+    Return provider connection health status and discovered tool counts.
+    Never returns API keys, secrets, headers, or tokens.
+    """
+    fs = get_flight_service()
+    return fs.health_check()
+
+
+# ============================================================
+# PROVIDER CONFIG (safe — no secrets)
+# ============================================================
+
+@app.get("/api/config/provider", response_model=ProviderConfigResponse)
+def get_provider_config():
+    """
+    Return non-sensitive provider configuration.
+    Never returns API keys, secrets, or tokens.
+    """
+    fs = get_flight_service()
+    return ProviderConfigResponse(
+        provider_name=fs.active_provider_name,
+        real_data_enabled=fs.real_enabled,
+        demo_fallback_enabled=(
+            os.getenv("ENABLE_DEMO_FALLBACK", "true").lower() == "true"
+        ),
+        cache_ttl_seconds=int(os.getenv("FLIGHT_STATUS_CACHE_SECONDS", "300")),
+        min_connection_minutes=DEFAULT_MIN_CONNECTION_MINUTES,
+    )
+
+
+# ============================================================
+# FLIGHT STATUS (real or demo via provider layer)
+# ============================================================
+
+@app.get("/api/flights/status", response_model=FlightStatusResponse)
+def get_flight_status(
+    flight_number: str = Query(..., description="Full flight number e.g. EK527"),
+    date: str = Query(..., description="Travel date YYYY-MM-DD e.g. 2026-07-25"),
+    carrier: Optional[str] = Query(None, description="Optional 2-letter IATA airline code"),
+):
+    """
+    Fetch real-time flight status via the configured flight provider.
+
+    Flow:
+      Cache hit → return cached result
+      Real provider → normalize → cache → return (data_source=REAL)
+      Provider failure → demo data (data_source=DEMO) + provider_warning
+
+    Never returns provider credentials or raw auth errors.
+    """
+    # Basic input validation
+    flight_number = flight_number.upper().strip()
+    date = date.strip()
+
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Use YYYY-MM-DD."
+        )
+
+    if not flight_number or len(flight_number) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid flight number."
+        )
+
+    fs = get_flight_service()
+    status = fs.get_flight_status(flight_number, date, carrier)
+
+    return FlightStatusResponse(
+        flight_number=status.flight_number,
+        airline_code=status.airline_code,
+        airline_name=status.airline_name,
+        origin_iata=status.origin.iata,
+        origin_name=status.origin.name,
+        origin_city=status.origin.city,
+        origin_terminal=status.origin.terminal,
+        origin_gate=status.origin.gate,
+        destination_iata=status.destination.iata,
+        destination_name=status.destination.name,
+        destination_city=status.destination.city,
+        destination_terminal=status.destination.terminal,
+        destination_gate=status.destination.gate,
+        scheduled_departure=status.scheduled_departure,
+        estimated_departure=status.estimated_departure,
+        actual_departure=status.actual_departure,
+        scheduled_arrival=status.scheduled_arrival,
+        estimated_arrival=status.estimated_arrival,
+        actual_arrival=status.actual_arrival,
+        delay_minutes=status.delay_minutes,
+        status=status.status,
+        data_source=status.data_source,
+        last_updated=status.last_updated,
+        provider_warning=status.provider_warning,
+    )
+
+
+# ============================================================
+# TRIP MONITORING (main real-data monitoring endpoint)
+# ============================================================
+
+@app.post("/api/trips/{trip_id}/check")
+def check_trip(
+    trip_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Refresh flight status for all segments in a trip.
+
+    Flow:
+      1. Load trip + segments
+      2. For each active segment, fetch latest status from provider
+      3. Update segment with new estimated times, delay, data_source
+      4. Detect disruptions (DELAY, CANCELLATION)
+      5. Analyze connection impact
+      6. If connection missed → trigger recovery
+      7. Return full monitoring response
+
+    The frontend must NOT calculate disruption logic.
+    All calculations happen here in FastAPI.
+    """
+    # --------------------------------------------------------
+    # LOAD TRIP
+    # --------------------------------------------------------
+
+    trip = db.query(models.Trip).filter(
+        models.Trip.trip_id == trip_id
+    ).first()
+
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    segments = db.query(models.FlightSegment).filter(
+        models.FlightSegment.trip_id == trip_id
+    ).all()
+
+    if not segments:
+        return {
+            "trip_id": trip_id,
+            "monitoring": {
+                "status": "NO_SEGMENTS",
+                "data_source": "DEMO",
+                "checked_at": now_iso(),
+            },
+            "flight_updates": [],
+            "disruption": {"detected": False},
+            "trip_status": trip.status,
+        }
+
+    fs = get_flight_service()
+    now = now_iso()
+
+    flight_updates = []
+    disruptions_detected = []
+
+    # --------------------------------------------------------
+    # UPDATE EACH SEGMENT
+    # --------------------------------------------------------
+
+    for segment in segments:
+        # Skip already-resolved segments
+        if segment.status in ("REBOOKED", "CONNECTION_MISSED"):
+            flight_updates.append({
+                "flight_number": segment.flight_number,
+                "status": segment.status,
+                "data_source": segment.data_source or "DEMO",
+                "note": "Segment already resolved — skipping status check",
+            })
+            continue
+
+        # Determine date from scheduled departure
+        travel_date = date_from_iso(segment.scheduled_departure)
+
+        flight_status = fs.get_flight_status(
+            segment.flight_number,
+            travel_date,
+        )
+
+        # Detect changes
+        old_estimated_arrival = segment.estimated_arrival
+        old_status = segment.status
+        old_delay = segment.delay_minutes or 0
+
+        new_delay = flight_status.delay_minutes or 0
+        status_changed = (new_delay != old_delay)
+
+        # Update segment with fresh data
+        segment.estimated_departure = (
+            flight_status.estimated_departure
+            or segment.scheduled_departure
+        )
+        segment.estimated_arrival = (
+            flight_status.estimated_arrival
+            or segment.scheduled_arrival
+        )
+        segment.actual_departure = flight_status.actual_departure
+        segment.actual_arrival = flight_status.actual_arrival
+        segment.delay_minutes = new_delay
+        segment.data_source = flight_status.data_source
+        segment.last_status_check = now
+        segment.airline_name = flight_status.airline_name
+        segment.origin_city = flight_status.origin.city
+        segment.destination_city = flight_status.destination.city
+        segment.terminal = flight_status.destination.terminal
+        segment.gate = flight_status.destination.gate
+
+        # Map provider status to segment status
+        if flight_status.status == "CANCELLED":
+            segment.status = "CANCELLED"
+        elif new_delay > 0 and segment.status == "CONFIRMED":
+            segment.status = "DELAYED"
+        # Don't reset DELAYED back to CONFIRMED if delay cleared
+        elif segment.status not in ("DELAYED", "CANCELLED"):
+            segment.status = "CONFIRMED"
+
+        provider_warning = flight_status.provider_warning
+
+        update_record = {
+            "flight_number": segment.flight_number,
+            "airline_name": segment.airline_name,
+            "origin": segment.origin,
+            "destination": segment.destination,
+            "scheduled_departure": segment.scheduled_departure,
+            "estimated_departure": segment.estimated_departure,
+            "scheduled_arrival": segment.scheduled_arrival,
+            "estimated_arrival": segment.estimated_arrival,
+            "delay_minutes": new_delay,
+            "status": segment.status,
+            "data_source": segment.data_source,
+            "last_updated": flight_status.last_updated,
+        }
+        if provider_warning:
+            update_record["provider_warning"] = provider_warning
+
+        flight_updates.append(update_record)
+
+        if status_changed and new_delay > 0:
+            disruptions_detected.append({
+                "flight_number": segment.flight_number,
+                "type": "DELAY",
+                "delay_minutes": new_delay,
+                "previous_delay": old_delay,
+            })
+
+        add_audit(
+            db,
+            trip_id,
+            "FLIGHT_STATUS_CHECKED",
+            (
+                f"{segment.flight_number}: {segment.status}, "
+                f"delay={new_delay}min, source={segment.data_source}"
+            )
+        )
+
+    # --------------------------------------------------------
+    # CONNECTION ANALYSIS
+    # --------------------------------------------------------
+
+    connection_status = "HEALTHY"
+    connection_buffer_minutes = None
+    recovery_required = False
+
+    if len(segments) >= 2:
+        # Sort segments by scheduled departure to find ordered connections
+        sorted_segments = sorted(
+            segments,
+            key=lambda s: s.scheduled_departure or ""
+        )
+
+        for i in range(len(sorted_segments) - 1):
+            prev = sorted_segments[i]
+            nxt = sorted_segments[i + 1]
+
+            try:
+                prev_arrival_str = prev.estimated_arrival or prev.scheduled_arrival
+                next_departure_str = nxt.estimated_departure or nxt.scheduled_departure
+
+                if prev_arrival_str and next_departure_str:
+                    prev_arr = parse_iso_flexible(prev_arrival_str)
+                    next_dep = parse_iso_flexible(next_departure_str)
+
+                    buffer = int(
+                        (next_dep - prev_arr).total_seconds() / 60
+                    )
+                    connection_buffer_minutes = buffer
+
+                    if buffer < DEFAULT_MIN_CONNECTION_MINUTES:
+                        connection_status = "MISSED_CONNECTION"
+                        recovery_required = True
+                        add_audit(
+                            db,
+                            trip_id,
+                            "MISSED_CONNECTION",
+                            (
+                                f"Connection {prev.flight_number}→{nxt.flight_number} "
+                                f"buffer={buffer}min (min={DEFAULT_MIN_CONNECTION_MINUTES}min)"
+                            )
+                        )
+                    elif buffer < DEFAULT_MIN_CONNECTION_MINUTES + 30:
+                        connection_status = "AT_RISK"
+                        add_audit(
+                            db,
+                            trip_id,
+                            "CONNECTION_AT_RISK",
+                            (
+                                f"Connection {prev.flight_number}→{nxt.flight_number} "
+                                f"only {buffer}min buffer"
+                            )
+                        )
+            except Exception as e:
+                logger.warning(
+                    "check_trip: connection analysis failed — %s", e
+                )
+
+    db.commit()
+
+    # --------------------------------------------------------
+    # DETERMINE DATA SOURCE FOR MONITORING SUMMARY
+    # --------------------------------------------------------
+
+    sources = [u.get("data_source", "DEMO") for u in flight_updates]
+    monitoring_source = "REAL" if "REAL" in sources else (
+        "CACHE" if "CACHE" in sources else "DEMO"
+    )
+
+    return {
+        "trip_id": trip_id,
+
+        "monitoring": {
+            "status": "CHECKED",
+            "data_source": monitoring_source,
+            "checked_at": now,
+            "provider": fs.active_provider_name,
+        },
+
+        "flight_updates": flight_updates,
+
+        "disruption": {
+            "detected": len(disruptions_detected) > 0
+            or connection_status in ("MISSED_CONNECTION", "AT_RISK"),
+            "events": disruptions_detected,
+        },
+
+        "impact_analysis": {
+            "connection_status": connection_status,
+            "connection_buffer_minutes": connection_buffer_minutes,
+            "recovery_required": recovery_required,
+        },
+
+        "trip_status": trip.status,
     }
 
 
@@ -2355,6 +2885,200 @@ def get_recovery_plan(
 
 
 # ============================================================
+# TRIP MANAGEMENT ENDPOINTS
+# ============================================================
+
+class CreateTripRequest(BaseModel):
+    trip_name: str
+    traveler_name: Optional[str] = "Traveler"
+    destination: str
+    start_date: str
+    end_date: str
+    hotel_name: Optional[str] = None
+    hotel_city: Optional[str] = None
+    transfer_pickup: Optional[str] = None
+    transfer_drop: Optional[str] = None
+
+
+class AddFlightSegmentRequest(BaseModel):
+    flight_number: str
+    travel_date: str
+
+
+@app.get("/api/trips")
+def list_trips(db: Session = Depends(get_db)):
+    """List all trips in the system."""
+    trips = db.query(models.Trip).all()
+    results = []
+    for trip in trips:
+        segments = db.query(models.FlightSegment).filter(
+            models.FlightSegment.trip_id == trip.trip_id
+        ).all()
+        results.append({
+            "trip": trip,
+            "segments_count": len(segments),
+            "flights": segments
+        })
+    return {"trips": results}
+
+
+@app.post("/api/trips")
+def create_trip(payload: CreateTripRequest, db: Session = Depends(get_db)):
+    """Create a new trip with optional default policy, hotel, and transfer."""
+    trip_id = f"TRIP-{uuid.uuid4().hex[:6].upper()}"
+    
+    trip = models.Trip(
+        trip_id=trip_id,
+        traveler_name=payload.traveler_name or "Traveler",
+        trip_name=payload.trip_name,
+        destination=payload.destination,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        status="HEALTHY"
+    )
+    db.add(trip)
+
+    # Default policy
+    policy = models.PolicyRule(
+        trip_id=trip_id,
+        auto_rebook_limit=15000,
+        approval_limit=40000,
+        hotel_limit=10000,
+        allowed_cabin="ECONOMY",
+        alternative_airport_allowed="ALLOWED"
+    )
+    db.add(policy)
+
+    # Optional hotel
+    if payload.hotel_name:
+        hotel = models.HotelBooking(
+            booking_id=f"HTL-{uuid.uuid4().hex[:6].upper()}",
+            trip_id=trip_id,
+            hotel_name=payload.hotel_name,
+            city=payload.hotel_city or payload.destination,
+            check_in_date=payload.start_date,
+            check_out_date=payload.end_date,
+            expected_arrival=f"{payload.start_date}T18:00:00",
+            status="CONFIRMED"
+        )
+        db.add(hotel)
+
+    # Optional transfer
+    if payload.transfer_pickup and payload.transfer_drop:
+        transfer = models.Transfer(
+            transfer_id=f"TRF-{uuid.uuid4().hex[:6].upper()}",
+            trip_id=trip_id,
+            pickup_location=payload.transfer_pickup,
+            drop_location=payload.transfer_drop,
+            pickup_time=f"{payload.start_date}T19:00:00",
+            status="CONFIRMED"
+        )
+        db.add(transfer)
+
+    db.commit()
+    db.refresh(trip)
+    return {"message": "Trip created successfully", "trip_id": trip_id, "trip": trip}
+
+
+@app.post("/api/trips/{trip_id}/flights")
+def add_flight_to_trip(
+    trip_id: str,
+    payload: AddFlightSegmentRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Fetch real/demo flight data for a given flight number & date,
+    then save the segment under the specified trip.
+    """
+    trip = db.query(models.Trip).filter(models.Trip.trip_id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    fs = get_flight_service()
+    status = fs.get_flight_status(payload.flight_number, payload.travel_date)
+
+    segment = models.FlightSegment(
+        trip_id=trip_id,
+        flight_number=status.flight_number,
+        origin=status.origin.iata,
+        destination=status.destination.iata,
+        scheduled_departure=status.scheduled_departure or f"{payload.travel_date}T10:00:00",
+        scheduled_arrival=status.scheduled_arrival or f"{payload.travel_date}T14:00:00",
+        estimated_departure=status.estimated_departure or status.scheduled_departure or f"{payload.travel_date}T10:00:00",
+        estimated_arrival=status.estimated_arrival or status.scheduled_arrival or f"{payload.travel_date}T14:00:00",
+        actual_departure=status.actual_departure,
+        actual_arrival=status.actual_arrival,
+        status="CONFIRMED" if status.status not in ("CANCELLED", "DELAYED") else status.status,
+        provider=fs.active_provider_name,
+        data_source=status.data_source,
+        last_status_check=now_iso(),
+        delay_minutes=status.delay_minutes,
+        terminal=status.destination.terminal,
+        gate=status.destination.gate,
+        airline_name=status.airline_name,
+        origin_city=status.origin.city,
+        destination_city=status.destination.city
+    )
+
+    db.add(segment)
+    db.commit()
+    db.refresh(segment)
+
+    return {"message": "Flight segment added successfully", "segment": segment}
+
+
+@app.delete("/api/trips/{trip_id}/flights/{segment_id}")
+def remove_flight_segment(
+    trip_id: str,
+    segment_id: int,
+    db: Session = Depends(get_db)
+):
+    """Remove a flight segment from a trip."""
+    segment = db.query(models.FlightSegment).filter(
+        models.FlightSegment.id == segment_id,
+        models.FlightSegment.trip_id == trip_id
+    ).first()
+
+    if not segment:
+        raise HTTPException(status_code=404, detail="Flight segment not found")
+
+    db.delete(segment)
+    db.commit()
+    return {"message": "Flight segment deleted", "segment_id": segment_id}
+
+
+@app.post("/api/recovery/{plan_id}/approve")
+def approve_recovery_plan(
+    plan_id: str,
+    approval: ApprovalRequest,
+    db: Session = Depends(get_db)
+):
+    """Approve or reject a pending recovery plan."""
+    plan = db.query(models.RecoveryPlan).filter(
+        models.RecoveryPlan.plan_id == plan_id
+    ).first()
+
+    if not plan:
+        raise HTTPException(status_code=404, detail="Recovery plan not found")
+
+    trip = db.query(models.Trip).filter(models.Trip.trip_id == plan.trip_id).first()
+
+    if approval.approved:
+        plan.status = "COMPLETED"
+        if trip:
+            trip.status = "RECOVERED"
+        add_audit(db, plan.trip_id, "RECOVERY_APPROVED", f"Recovery plan {plan_id} approved by user")
+    else:
+        plan.status = "REJECTED"
+        if trip:
+            trip.status = "ESCALATED"
+        add_audit(db, plan.trip_id, "RECOVERY_REJECTED", f"Recovery plan {plan_id} rejected by user")
+
+    db.commit()
+    return {"message": f"Recovery plan {'approved' if approval.approved else 'rejected'}", "plan": plan}
+
+
+# ============================================================
 # GET NOTIFICATIONS
 # ============================================================
 
@@ -2380,4 +3104,4 @@ def get_notifications(
         "notifications":
             notifications
 
-    }
+    }
